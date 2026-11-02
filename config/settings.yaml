@@ -1,0 +1,136 @@
+# Cloud Cost Optimizer - runtime configuration
+# Every section maps to one architecture layer. Values here override code defaults.
+
+project:
+  name: cloud-cost-optimizer
+  environment: dev
+
+# ---------------------------------------------------------------------------
+# Persistence (raw metadata store, findings, recommendations, audit log)
+#   mode: memory -> everything in-process (tests / demos)
+#   mode: delta  -> Unity Catalog Delta tables in <catalog>.<schema>
+# ---------------------------------------------------------------------------
+storage:
+  mode: delta
+  catalog: main                # TODO: change to your ops/finops catalog
+  schema: cloud_cost_optimizer
+
+# ---------------------------------------------------------------------------
+# Connector layer - enable only the sources you have credentials for
+# ---------------------------------------------------------------------------
+connectors:
+  databricks:
+    enabled: true
+    catalogs: []               # empty -> all catalogs except system/samples
+    schema_include: ["*"]
+    schema_exclude: ["information_schema"]
+    max_tables: 500
+    max_jobs: 2000
+    history_limit: 200         # DESCRIBE HISTORY depth per table
+    collect_file_stats: false  # exact per-file / per-partition stats (scans file metadata)
+    file_stats_max_bytes: 5.0e12
+    small_file_bytes: 33554432 # 32 MB
+    lookback_days: 30          # billing + compute metrics window
+    access_lookback_days: 90   # lineage window used for inactivity checks
+    collect_scan_stats: false  # system.query.history pruning stats (heavier query)
+    scan_stats_max_tables: 50
+    skip_job_clusters: true
+    pipeline_details: false
+  aws:
+    enabled: false
+    region: us-east-1
+    profile: null
+    lookback_days: 30
+    databricks_tag_key: Vendor
+    databricks_tag_value: Databricks
+  azure:
+    enabled: false
+    subscription_id: null
+    lookback_days: 30
+  gcp:
+    enabled: false
+    project_id: null
+    billing_export_table: null # project.dataset.gcp_billing_export_v1_XXXX
+    lookback_days: 30
+  snowflake:
+    enabled: false
+    account: null
+    user: null
+    role: null
+    warehouse: null
+    password_secret: {scope: null, key: null}
+    credit_price_usd: 3.0
+    lookback_days: 30
+  sample:
+    enabled: false             # synthetic Databricks-shaped data for demos/tests
+
+# ---------------------------------------------------------------------------
+# Specialist agents
+# ---------------------------------------------------------------------------
+agents:
+  max_workers: 4
+  delta_table_optimization:
+    enabled: true
+    thresholds:
+      small_file_bytes: 33554432          # 32 MB
+      target_file_bytes: 134217728        # 128 MB
+      min_files_for_optimize: 50
+      small_file_ratio: 0.4
+      max_files_per_partition: 1000
+      write_file_bytes: 8388608           # 8 MB avg output file => poor write pattern
+      min_write_ops: 10
+      write_lookback_days: 30
+      write_amplification: 5.0
+      stale_partition_days: 180
+      stale_partition_min_share: 0.2
+      data_retention_days: 730            # business retention; override per table with TBLPROPERTY cco.data_retention_days
+      inactivity_days: 90
+      max_deleted_file_retention_days: 30
+      min_deleted_file_retention_days: 7
+      vacuum_min_reclaim_gb: 10
+      vacuum_interval_days: 7
+      partition_skew_ratio: 10.0
+      min_partitions_for_skew: 5
+      unpruned_scan_ratio: 0.5
+      min_scans: 20
+      wide_table_columns: 100
+      wide_table_target_file_size: 256mb
+      growth_ratio_30d: 0.5
+      storage_cost_per_gb_month: 0.023
+      archive_cost_per_gb_month: 0.004
+      optimize_read_savings_factor: 0.15
+
+# ---------------------------------------------------------------------------
+# Scoring / recommendation engine
+# ---------------------------------------------------------------------------
+scoring:
+  savings_cap_usd: 10000
+  min_score_for_approval: 25
+  prod_resource_patterns: ["*prod*"]
+
+# ---------------------------------------------------------------------------
+# AI reasoning layer (runs AFTER rule-based scoring; cannot invent actions)
+# ---------------------------------------------------------------------------
+llm:
+  enabled: true
+  provider: databricks
+  endpoint: databricks-meta-llama-3-3-70b-instruct
+  max_items: 25
+  max_tokens: 2500
+  temperature: 0.1
+  max_confidence_delta: 0.2
+
+# ---------------------------------------------------------------------------
+# Human approval + optional action automation
+# ---------------------------------------------------------------------------
+approval:
+  dual_approval_risks: [high]
+  resurface_rejected_after_days: 30
+
+actions:
+  dry_run: true
+  allowed: [optimize, vacuum, set_retention, enable_auto_optimize, set_target_file_size, enable_deletion_vectors]
+
+alerts:
+  slack_webhook_url: null
+  min_priority: P2

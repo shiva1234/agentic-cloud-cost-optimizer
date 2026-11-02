@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud-cost-optimizer"
+version = "0.1.0"
+description = "Modular, cloud-agnostic cost optimization: metadata -> rules -> AI reasoning -> human approval -> actions"
+requires-python = ">=3.10"
+dependencies = [
+  "pyyaml>=6.0",
+  "databricks-sdk>=0.30.0",
+]
+
+[project.optional-dependencies]
+aws = ["boto3>=1.28"]
+azure = ["azure-identity>=1.15", "azure-mgmt-costmanagement>=4.0", "azure-mgmt-storage>=21.0", "azure-mgmt-monitor>=6.0"]
+gcp = ["google-cloud-bigquery>=3.11", "google-cloud-storage>=2.10"]
+snowflake = ["snowflake-connector-python>=3.5"]
+api = ["fastapi>=0.110", "uvicorn>=0.27"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+cco = "cco.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
