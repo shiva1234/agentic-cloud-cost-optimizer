@@ -5,6 +5,10 @@ Responsibilities:
   * de-duplicate recommendations for the same (resource, action)
   * resolve cross-recommendation conflicts (e.g. don't OPTIMIZE a table we propose to archive)
   * order dependent actions (e.g. shorten retention before VACUUM)
+  * cross-agent supersession: retiring a job/pipeline/table suppresses tuning of the same resource
+    (e.g. no RESIZE for a job that the redundancy agent proposes to merge away)
+  * group overlapping recommendations (same or related resources) -> group_id, used by the
+    Optimization Queue (cco.agents.queue) to produce ONE prioritized list
   * build a summary for the UI / API / alerts
 """
 from __future__ import annotations
@@ -19,7 +23,7 @@ from typing import Any
 from cco.agents.base import AgentContext, AgentResult, BaseAgent
 from cco.agents.planner import ExecutionPlan
 from cco.etl.facts import FactStore
-from cco.models.canonical import ActionType, Finding, Recommendation, Severity
+from cco.models.canonical import DECOMMISSION_ACTIONS, ActionType, Finding, Recommendation, Severity, stable_id
 from cco.utils import utcnow
 
 log = logging.getLogger(__name__)
@@ -42,6 +46,7 @@ class AnalysisReport:
     agent_stats: dict[str, dict] = field(default_factory=dict)
     errors: list[dict] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
+    queue: list[Any] = field(default_factory=list)  # QueueItem list, built after scoring
     executive_summary: str | None = None
     generated_at: datetime = field(default_factory=utcnow)
 
@@ -64,7 +69,9 @@ class Coordinator:
             report.agent_stats[res.agent] = res.stats
             report.errors.extend({**e, "agent": res.agent} for e in res.errors)
         merged = self._dedupe(recs)
-        report.recommendations = self._resolve_conflicts(merged, report)
+        resolved = self._resolve_conflicts(merged, report)
+        report.recommendations = self._supersede(resolved, report)
+        self._group(report.recommendations)
         report.summary = self._summarize(report)
         return report
 
@@ -99,6 +106,8 @@ class Coordinator:
             keep.estimated_monthly_savings = max(keep.estimated_monthly_savings, other.estimated_monthly_savings)
             keep.confidence = min(0.95, max(keep.confidence, other.confidence) + 0.05)  # corroborated by 2+ checks
             keep.command = keep.command or other.command
+            keep.related_resources = sorted(set(keep.related_resources) | set(other.related_resources))
+            keep.metrics = {**other.metrics, **keep.metrics}
             by_id[r.id] = keep
         return list(by_id.values())
 
@@ -128,6 +137,57 @@ class Coordinator:
         return out
 
     @staticmethod
+    def _supersede(recs: list[Recommendation], report: AnalysisReport) -> list[Recommendation]:
+        """A resource proposed for retirement (merge, decommission, pause, dedupe) gets no tuning recommendations."""
+        retire: dict[str, Recommendation] = {}
+        for r in recs:
+            if r.action_type in DECOMMISSION_ACTIONS and r.resource_type != "table":
+                cur = retire.get(r.resource_id)
+                if cur is None or r.confidence > cur.confidence:
+                    retire[r.resource_id] = r
+        out: list[Recommendation] = []
+        for r in recs:
+            boss = retire.get(r.resource_id)
+            if boss and r.action_type not in DECOMMISSION_ACTIONS:
+                r.superseded_by = boss.id
+                boss.finding_ids = list(dict.fromkeys(boss.finding_ids + r.finding_ids))
+                report.suppressed.append({"id": r.id, "resource_id": r.resource_id, "action_type": r.action_type.value,
+                                          "agent": r.agent, "superseded_by": boss.id,
+                                          "reason": f"resource proposed for {boss.action_type.value} by {boss.agent}"})
+                continue
+            out.append(r)
+        return out
+
+    @staticmethod
+    def _group(recs: list[Recommendation]) -> None:
+        """Union-find over resource_id + related_resources: overlapping recommendations share a group_id."""
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        rec_keys = {r.resource_id for r in recs}
+        for r in recs:
+            find(r.resource_id)
+            for rel in r.related_resources:
+                if rel in rec_keys:  # only link to resources that carry recommendations themselves
+                    union(r.resource_id, rel)
+            gk = r.metrics.get("group_key")  # explicit sets, e.g. all copies of one duplicated job
+            if gk:
+                union(r.resource_id, f"key:{gk}")
+        for r in recs:
+            r.group_id = stable_id("group", find(r.resource_id))
+
+    @staticmethod
     def _summarize(report: AnalysisReport) -> dict[str, Any]:
         recs = report.recommendations
         sev = Counter(f.severity.value for f in report.findings)
@@ -141,6 +201,7 @@ class Coordinator:
             "suppressed": len(report.suppressed),
             "findings_by_severity": {s.value: sev.get(s.value, 0) for s in Severity},
             "recommendations_by_action": dict(Counter(r.action_type.value for r in recs)),
+            "recommendations_by_agent": dict(Counter(r.agent for r in recs)),
             "estimated_monthly_savings": round(sum(r.estimated_monthly_savings for r in recs), 2),
             "top_resources_by_savings": sorted(
                 ({"resource_id": k, "savings": round(v, 2)} for k, v in by_resource.items()), key=lambda x: -x["savings"]

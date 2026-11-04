@@ -12,8 +12,8 @@ project:
 # ---------------------------------------------------------------------------
 storage:
   mode: delta
-  catalog: main                # TODO: change to your ops/finops catalog
-  schema: cloud_cost_optimizer
+  catalog: dt_dev_platinum                # TODO: change to your ops/finops catalog
+  schema: sales
 
 # ---------------------------------------------------------------------------
 # Connector layer - enable only the sources you have credentials for
@@ -21,7 +21,7 @@ storage:
 connectors:
   databricks:
     enabled: true
-    catalogs: []               # empty -> all catalogs except system/samples
+    catalogs: ["dt_dev_platinum", "dt_dev_gold"]               # empty -> all catalogs except system/samples
     schema_include: ["*"]
     schema_exclude: ["information_schema"]
     max_tables: 500
@@ -99,6 +99,88 @@ agents:
       storage_cost_per_gb_month: 0.023
       archive_cost_per_gb_month: 0.004
       optimize_read_savings_factor: 0.15
+
+  # B. Compute utilization (clusters, job compute, pools)
+  compute_utilization:
+    enabled: true
+    thresholds:
+      min_node_hours: 10                  # ignore clusters with less node time in the window
+      min_monthly_cost: 25
+      idle_ratio: 0.5                     # share of node time with <5% CPU
+      max_autotermination_minutes: 60
+      recommended_autotermination_minutes: 30
+      always_on_ratio: 0.6                # up >= 60% of the window
+      offhours_min_share: 0.3
+      offhours_idle_ratio: 0.7
+      autoscale_min_fixed_workers: 2
+      autoscale_min_ratio: 0.8            # min >= 80% of max => autoscaling can't scale down
+      overprovisioned_p95_cpu: 40
+      overprovisioned_p95_mem: 50
+      target_cpu_pct: 70
+      target_mem_pct: 80
+      low_concurrency_max_cpu: 20
+      low_concurrency_min_workers: 4
+      job_min_runs: 3
+      job_idle_ratio: 0.5
+      startup_setup_ratio: 0.3
+      startup_min_runs: 20
+      queue_seconds: 300
+      spot_min_success_rate: 0.9
+      vm_cost_ratio: 1.0                  # cloud VM $ per DBU $ (VM cost is billed by AWS, not in system.billing)
+      spot_discount: 0.6
+      all_purpose_premium: 0.45
+      pool_vm_hourly_cost: 0.5
+      node_generation_savings: 0.1
+
+  # C. Jobs / workflow redundancy
+  job_redundancy:
+    enabled: true
+    thresholds:
+      min_runs: 3
+      min_monthly_cost: 10
+      lineage_jaccard: 0.9                # same sources AND targets => same transformation
+      schedule_overlap_cosine: 0.8        # start-hour profile similarity upstream vs downstream
+      retry_ratio: 0.2
+      retry_success_max: 0.3
+      min_task_runs: 10
+      reprocess_ratio: 1.5                # runs/day > 1.5 x upstream writes/day
+      reprocess_min_runs_per_day: 2
+      overwrite_share: 0.8
+      low_value_min_cost: 100
+      duration_cv: 1.0
+      failing_success_rate: 0.8
+      peak_hours: 3
+      peak_share: 0.5
+      peak_queue_s: 120
+      shift_min_cost: 200
+
+  # D. Pipeline / data-flow optimization (Lakeflow Spark Declarative Pipelines)
+  pipeline_optimization:
+    enabled: true
+    thresholds:
+      inactivity_days: 60
+      lineage_jaccard: 0.8
+      ingestion_path_jaccard: 0.8
+      ingestion_target_jaccard_max: 0.5
+      too_frequent_ratio: 3.0
+      min_runs_per_day_frequency: 4
+      full_refresh_ratio: 0.3
+      full_refresh_min_runs: 5
+      critical_min_consumer_reads: 1000
+      critical_max_failure_rate: 0.1
+      # duplicate_ingestion uses structural evidence only (exact file/table, date/hive partitions, multi-file roots,
+      # self-reference + event-log removal). Optional org-specific exclusions as globs, e.g. ["*/shared_reference/*"]:
+      ingestion_exclude_patterns: []
+      multi_file_root_min_files: 3
+      emit_lineage_gaps: true             # info finding when ingestion sources are missing from lineage
+      incident_min_cost: 50               # report canceled/failed-update spend above this as an incident
+
+# ---------------------------------------------------------------------------
+# Monthly cost estimation (robust to one-off spikes; applies to every agent)
+# ---------------------------------------------------------------------------
+cost_estimation:
+  min_observation_days: 14              # never extrapolate a month from fewer days
+  outlier_cap_x_median: 5.0             # winsorize each day at N x median active-day cost (0 = off)
 
 # ---------------------------------------------------------------------------
 # Scoring / recommendation engine

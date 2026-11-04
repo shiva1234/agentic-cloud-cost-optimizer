@@ -5,17 +5,22 @@ functions here (or passing `extra` to Normalizer) - nothing downstream changes.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from cco.connectors.base import RawRecord
+from cco.etl.fingerprint import logical_name, logical_path, task_fingerprint, task_source
 from cco.models.canonical import (
-    Account, CanonicalObject, Cluster, CostMetric, Job, PartitionStats, Pipeline, Provider,
-    StorageObject, Table, TableOperation, Task, UsageMetric, Workspace, stable_id,
+    Account, CanonicalObject, Cluster, ComputePool, CostMetric, Job, Lineage, PartitionStats, Pipeline, Provider,
+    RunStats, StorageObject, Table, TableOperation, Task, UsageMetric, Workspace, stable_id,
 )
 from cco.utils import to_dt, to_float, to_int
+
+_JOB_SCOPED = re.compile(r"\{\{\s*job\.(parameters|name|id)")
 
 log = logging.getLogger(__name__)
 
@@ -79,19 +84,84 @@ def _dbx_workspace(r: RawRecord):
     yield Workspace(id=str(p["workspace_id"]), provider=DBX, name=p.get("host") or str(p["workspace_id"]), url=p.get("host"))
 
 
+def _availability(p: dict) -> str | None:
+    for k in ("aws_attributes", "azure_attributes", "gcp_attributes"):
+        a = p.get(k) or {}
+        if a.get("availability"):
+            return str(a["availability"])
+    return None
+
+
+def _cluster_spec(nc: dict) -> dict[str, Any]:
+    """Compact view of a new_cluster spec (job clusters)."""
+    auto = nc.get("autoscale") or {}
+    return {
+        "node_type": nc.get("node_type_id"), "driver_node_type": nc.get("driver_node_type_id"),
+        "num_workers": nc.get("num_workers"), "min_workers": auto.get("min_workers"), "max_workers": auto.get("max_workers"),
+        "availability": _availability(nc), "pool_id": nc.get("instance_pool_id"), "runtime": nc.get("spark_version"),
+        "photon": nc.get("runtime_engine") == "PHOTON" if nc.get("runtime_engine") else None,
+    }
+
+
 @normalizes("databricks", "clusters")
 def _dbx_cluster(r: RawRecord):
     p = r.payload
+    if p.get("_source") == "system":  # system.compute.clusters shape
+        aws = p.get("aws_attributes") or {}
+        yield Cluster(
+            id=p["cluster_id"], provider=DBX, name=p.get("cluster_name") or "", workspace_id=str(p.get("workspace_id") or "") or None,
+            tags=p.get("tags") or {}, node_type=p.get("worker_node_type"), driver_node_type=p.get("driver_node_type"),
+            num_workers=to_int(p.get("worker_count")), min_workers=to_int(p.get("min_autoscale_workers")),
+            max_workers=to_int(p.get("max_autoscale_workers")), autotermination_minutes=to_int(p.get("auto_termination_minutes")),
+            runtime_version=p.get("dbr_version"), cluster_source=p.get("cluster_source"), policy_id=p.get("policy_id"),
+            owner=p.get("owned_by"), availability=_availability(p), driver_pool_id=p.get("driver_instance_pool_id"),
+            worker_pool_id=p.get("worker_instance_pool_id"), worker_cores=to_float(p.get("worker_cores")),
+            worker_memory_mb=to_float(p.get("worker_memory_mb")), deleted=p.get("delete_time") is not None,
+            attributes={"data_security_mode": p.get("data_security_mode"), "first_on_demand": aws.get("first_on_demand")},
+        )
+        return
     auto = p.get("autoscale") or {}
     yield Cluster(
         id=p["cluster_id"], provider=DBX, name=p.get("cluster_name", ""), tags=p.get("custom_tags") or {},
-        node_type=p.get("node_type_id"), driver_node_type=p.get("driver_node_type_id"), num_workers=p.get("num_workers"),
-        min_workers=auto.get("min_workers"), max_workers=auto.get("max_workers"),
-        autotermination_minutes=p.get("autotermination_minutes"), runtime_version=p.get("spark_version"),
+        node_type=p.get("node_type_id"), driver_node_type=p.get("driver_node_type_id"), num_workers=to_int(p.get("num_workers")),
+        min_workers=to_int(auto.get("min_workers")), max_workers=to_int(auto.get("max_workers")),
+        autotermination_minutes=to_int(p.get("autotermination_minutes")), runtime_version=p.get("spark_version"),
         cluster_source=p.get("cluster_source"), state=p.get("state"), policy_id=p.get("policy_id"),
         photon=(p.get("runtime_engine") == "PHOTON") if p.get("runtime_engine") else None,
-        attributes={"data_security_mode": p.get("data_security_mode")},
+        owner=p.get("creator_user_name"), availability=_availability(p), driver_pool_id=p.get("driver_instance_pool_id"),
+        worker_pool_id=p.get("instance_pool_id"), worker_cores=to_float(p.get("worker_cores")),
+        worker_memory_mb=to_float(p.get("worker_memory_mb")),
+        attributes={"data_security_mode": p.get("data_security_mode"), "first_on_demand": (p.get("aws_attributes") or {}).get("first_on_demand")},
     )
+
+
+@normalizes("databricks", "pools")
+def _dbx_pool(r: RawRecord):
+    p = r.payload
+    st = p.get("stats") or {}
+    yield ComputePool(
+        id=p["instance_pool_id"], provider=DBX, name=p.get("instance_pool_name", ""), node_type=p.get("node_type_id"),
+        min_idle=to_int(p.get("min_idle_instances"), 0), max_capacity=to_int(p.get("max_capacity")),
+        idle_autotermination_minutes=to_int(p.get("idle_instance_autotermination_minutes")),
+        used_count=to_int(st.get("used_count"), 0) + to_int(st.get("pending_used_count"), 0),
+        idle_count=to_int(st.get("idle_count"), 0) + to_int(st.get("pending_idle_count"), 0),
+        availability=_availability(p), tags=p.get("custom_tags") or {},
+    )
+
+
+def _trigger_kind(s: dict) -> str:
+    trig = s.get("trigger") or {}
+    if trig.get("file_arrival"):
+        return "file_arrival"
+    if trig.get("table_update") or trig.get("table"):
+        return "table_update"
+    if trig.get("periodic"):
+        return "periodic"
+    if s.get("continuous"):
+        return "continuous"
+    if s.get("schedule"):
+        return "cron"
+    return "manual"   # API / external scheduler (e.g. enterprise orchestrators)
 
 
 @normalizes("databricks", "jobs")
@@ -99,11 +169,39 @@ def _dbx_job(r: RawRecord):
     p = r.payload
     s = p.get("settings") or {}
     sched = s.get("schedule") or {}
+    tasks = s.get("tasks") or []
+    pause = sched.get("pause_status") or (s.get("trigger") or {}).get("pause_status") or (s.get("continuous") or {}).get("pause_status")
+    fps = sorted(fp for fp in (task_fingerprint(t) for t in tasks) if fp)
+    # Generic notebooks/wheels are often driven by job-level parameters (source_location, table, ...):
+    # identical tasks with different job parameter defaults are NOT duplicates.
+    jparams = sorted((str(x.get("name")), str(x.get("default"))) for x in s.get("parameters") or [])
+    if fps and jparams:
+        fps.append("jobparams:" + stable_id(*[f"{k}={v}" for k, v in jparams]))
+    elif fps and _JOB_SCOPED.search(json.dumps(tasks, default=str)):
+        # tasks read {{job.parameters.*}} / {{job.name}} but the defaults are not in the payload (jobs/list omits
+        # them): behaviour depends on the job itself, so only copies of the SAME logical job can be duplicates.
+        fps.append("jobscoped:" + stable_id(logical_name(s.get("name"))))
+    sources = sorted({src for _, src, _ in (task_source(t) for t in tasks) if src})
     yield Job(
         id=str(p["job_id"]), provider=DBX, name=s.get("name", ""), tags=s.get("tags") or {},
         creator=p.get("creator_user_name"), run_as=p.get("run_as_user_name"),
-        schedule=sched.get("quartz_cron_expression"), paused=(sched.get("pause_status") == "PAUSED") if sched else None,
-        task_count=len(s.get("tasks") or []),
+        schedule=sched.get("quartz_cron_expression"), paused=(pause == "PAUSED") if pause else None,
+        task_count=len(tasks),
+        attributes={
+            "logical_name": logical_name(s.get("name")),
+            "trigger_kind": _trigger_kind(s),
+            "max_concurrent_runs": s.get("max_concurrent_runs"),
+            "job_clusters": [{"key": jc.get("job_cluster_key"), **_cluster_spec(jc.get("new_cluster") or {})} for jc in s.get("job_clusters") or []],
+            "existing_cluster_ids": sorted({t["existing_cluster_id"] for t in tasks if t.get("existing_cluster_id")}),
+            "uses_serverless": any(not (t.get("existing_cluster_id") or t.get("job_cluster_key") or t.get("new_cluster")) for t in tasks
+                                   if "pipeline_task" not in t and "condition_task" not in t and "run_job_task" not in t),
+            "task_fingerprints": fps,
+            "task_sources": sources,
+            "pipeline_ids": sorted({(t.get("pipeline_task") or {}).get("pipeline_id") for t in tasks if t.get("pipeline_task")}),
+            "max_retries": max([to_int(t.get("max_retries"), 0) for t in tasks] or [0]),
+            "deployment": (s.get("deployment") or {}).get("kind"),
+            "queue_enabled": (s.get("queue") or {}).get("enabled"),
+        },
     )
 
 
@@ -112,9 +210,16 @@ def _dbx_task(r: RawRecord):
     p = r.payload
     ttype = next((t for t in TASK_TYPES if t in p), None)
     compute = p.get("existing_cluster_id") or p.get("job_cluster_key") or ("serverless" if not p.get("new_cluster") else "new_cluster")
+    _, src, _ = task_source(p)
     yield Task(
         id=r.source_id, provider=DBX, name=p.get("task_key", ""), job_id=str(p.get("job_id")), task_key=p.get("task_key", ""),
         task_type=ttype, compute_ref=compute, depends_on=[d.get("task_key") for d in p.get("depends_on") or []],
+        attributes={
+            "fingerprint": task_fingerprint(p), "logical_source": src,
+            "max_retries": to_int(p.get("max_retries"), 0), "min_retry_interval_millis": p.get("min_retry_interval_millis"),
+            "retry_on_timeout": p.get("retry_on_timeout"),
+            "new_cluster": _cluster_spec(p["new_cluster"]) if p.get("new_cluster") else None,
+        },
     )
 
 
@@ -122,9 +227,27 @@ def _dbx_task(r: RawRecord):
 def _dbx_pipeline(r: RawRecord):
     p = r.payload
     spec = p.get("spec") or {}
+    sysset = p.get("sys_settings") or {}
+
+    def pick(k: str) -> Any:
+        return spec.get(k) if spec.get(k) is not None else sysset.get(k)
+
+    libs = [logical_path((lib.get("notebook") or lib.get("file") or {}).get("path")) for lib in spec.get("libraries") or []]
+    el = pick("event_log") or {}
+    event_log = None
+    if isinstance(el, dict) and el.get("name"):
+        parts = (el.get("catalog") or spec.get("catalog"), el.get("schema") or spec.get("schema") or spec.get("target"), el["name"])
+        event_log = ".".join(str(x) for x in parts if x)
     yield Pipeline(
         id=p["pipeline_id"], provider=DBX, name=p.get("name", ""), state=p.get("state"), creator=p.get("creator_user_name"),
-        continuous=spec.get("continuous"), serverless=spec.get("serverless"), photon=spec.get("photon"), edition=spec.get("edition"),
+        continuous=pick("continuous"), serverless=pick("serverless"), photon=pick("photon"), edition=pick("edition"),
+        tags=p.get("sys_tags") or spec.get("tags") or {},
+        attributes={
+            "logical_name": logical_name(p.get("name")), "development": pick("development"),
+            "pipeline_type": p.get("pipeline_type"), "run_as": p.get("run_as_user_name"),
+            "libraries": sorted(x for x in libs if x), "target": spec.get("target") or spec.get("schema"), "catalog": spec.get("catalog"),
+            "event_log_table": event_log,
+        },
     )
 
 
@@ -180,9 +303,60 @@ def _dbx_compute(r: RawRecord):
     p = r.payload
     cid = p["cluster_id"]
     kw = dict(period_start=to_dt(p.get("period_start")), period_end=to_dt(p.get("period_end")))
-    for name, unit in (("avg_cpu_pct", "%"), ("p95_cpu_pct", "%"), ("avg_mem_pct", "%"), ("instances", "count")):
-        if p.get(name) is not None:
-            yield _metric(DBX, cid, "cluster", name, p[name], unit=unit, **kw)
+    has_workers = (to_float(p.get("w_node_hours")) or 0) > 0
+    pre = "w_" if has_workers else "d_"
+    for name, unit in (("avg_cpu_pct", "%"), ("p95_cpu_pct", "%"), ("avg_mem_pct", "%"), ("p95_mem_pct", "%"),
+                       ("avg_cpu_wait_pct", "%"), ("idle_ratio", "ratio"), ("offhours_idle_ratio", "ratio"), ("offhours_share", "ratio")):
+        v = p.get(pre + name, p.get(name))
+        if v is not None:
+            yield _metric(DBX, cid, "cluster", name, v, unit=unit, **kw)
+    node_hours = p.get("node_hours")
+    if node_hours is None and (p.get("w_node_hours") is not None or p.get("d_node_hours") is not None):
+        node_hours = (to_float(p.get("w_node_hours")) or 0) + (to_float(p.get("d_node_hours")) or 0)
+    for name, v, unit in (("node_hours", node_hours, "h"), ("worker_node_hours", p.get("w_node_hours"), "h"),
+                          ("active_hours", p.get("active_hours"), "h"), ("instances", p.get("instances"), "count"),
+                          ("worker_instances", p.get("worker_instances"), "count"), ("window_days", p.get("window_days"), "d")):
+        if v is not None:
+            yield _metric(DBX, cid, "cluster", name, v, unit=unit, **kw)
+
+
+def _hist(h: Any) -> dict[int, int]:
+    return {int(k): int(v) for k, v in (h or {}).items() if k is not None}
+
+
+def _run_stats(p: dict, rid: str, rtype: str) -> RunStats:
+    return RunStats(
+        id=f"runstats:{rtype}:{rid}", provider=DBX, name=rid, workspace_id=str(p.get("workspace_id") or "") or None,
+        resource_id=rid, resource_type=rtype, window_days=to_int(p.get("window_days"), 30), runs=to_int(p.get("runs"), 0),
+        success_rate=to_float(p.get("success_rate")), avg_run_s=to_float(p.get("avg_run_s")), std_run_s=to_float(p.get("std_run_s")),
+        avg_exec_s=to_float(p.get("avg_exec_s")), avg_queue_s=to_float(p.get("avg_queue_s")), avg_setup_s=to_float(p.get("avg_setup_s")),
+        total_hours=to_float(p.get("total_hours")), first_run=to_dt(p.get("first_run")), last_run=to_dt(p.get("last_run")),
+        task_runs=to_int(p.get("task_runs"), 0), retries=to_int(p.get("retries"), 0),
+        retried_task_runs=to_int(p.get("retried_task_runs"), 0), retried_then_succeeded=to_int(p.get("retried_then_succeeded"), 0),
+        full_refreshes=to_int(p.get("full_refreshes"), 0), trigger_types={str(k): int(v) for k, v in (p.get("trigger_types") or {}).items()},
+        start_hour_histogram=_hist(p.get("start_hour_histogram")), compute_ids=[str(c) for c in p.get("compute_ids") or []],
+    )
+
+
+@normalizes("databricks", "job_run_stats")
+def _dbx_job_runs(r: RawRecord):
+    yield _run_stats(r.payload, str(r.payload["job_id"]), "job")
+
+
+@normalizes("databricks", "pipeline_run_stats")
+def _dbx_pipeline_runs(r: RawRecord):
+    yield _run_stats(r.payload, str(r.payload["pipeline_id"]), "pipeline")
+
+
+@normalizes("databricks", "lineage")
+def _dbx_lineage(r: RawRecord):
+    p = r.payload
+    etype = str(p.get("entity_type") or "job").lower()
+    yield Lineage(
+        id=f"lineage:{etype}:{p['entity_id']}", provider=DBX, name=str(p["entity_id"]), workspace_id=str(p.get("workspace_id") or "") or None,
+        resource_id=str(p["entity_id"]), resource_type=etype, sources=sorted(p.get("sources") or []),
+        targets=sorted(p.get("targets") or []), last_event=to_dt(p.get("last_event")),
+    )
 
 
 @normalizes("databricks", "access_logs")
@@ -204,12 +378,17 @@ def _dbx_access(r: RawRecord):
 @normalizes("databricks", "costs")
 def _dbx_cost(r: RawRecord):
     p = r.payload
+    day = to_dt(p.get("usage_date"))
+    attrs: dict[str, Any] = {"billing_origin_product": p.get("billing_origin_product"), "pricing": "list"}
+    if day is not None:  # daily rows -> robust estimator in FactStore.cost_details
+        attrs["granularity"] = "day"
+        attrs["incident_amount"] = to_float(p.get("incident_cost"), 0.0)
     yield CostMetric(
         id=stable_id("dbx", r.source_id), provider=DBX, name=p.get("sku_name", ""), workspace_id=str(p.get("workspace_id")),
         resource_id=str(p.get("resource_id")), resource_type=p.get("resource_type", "other"), amount=to_float(p.get("list_cost"), 0.0),
         sku=p.get("sku_name"), usage_quantity=to_float(p.get("usage_quantity")), usage_unit=p.get("usage_unit"),
-        period_start=to_dt(p.get("period_start")), period_end=to_dt(p.get("period_end")),
-        attributes={"billing_origin_product": p.get("billing_origin_product"), "pricing": "list"},
+        period_start=day or to_dt(p.get("period_start")), period_end=day or to_dt(p.get("period_end")),
+        attributes=attrs,
     )
 
 

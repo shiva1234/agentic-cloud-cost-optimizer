@@ -101,9 +101,17 @@ class DeltaTableFacts:
 
 
 class FactStore:
-    def __init__(self, objects: Iterable[CanonicalObject], now: datetime | None = None, storage_cost_per_gb_month: float = 0.023) -> None:
+    COST_DEFAULTS: dict[str, Any] = {
+        "min_observation_days": 14,    # never extrapolate a month from fewer days than this
+        "outlier_cap_x_median": 5.0,   # cap each day at N x median active-day cost (0 disables winsorization)
+    }
+
+    def __init__(self, objects: Iterable[CanonicalObject], now: datetime | None = None, storage_cost_per_gb_month: float = 0.023,
+                 cost_estimation: dict[str, Any] | None = None) -> None:
         self.now = now or utcnow()
         self.storage_cost_per_gb_month = storage_cost_per_gb_month
+        self.cost_cfg: dict[str, Any] = {**self.COST_DEFAULTS, **(cost_estimation or {})}
+        self._cost_cache: dict[str, dict[str, Any]] = {}
         self.objects: dict[str, dict[str, CanonicalObject]] = defaultdict(dict)
         self.usage: dict[str, dict[str, UsageMetric]] = defaultdict(dict)
         self.costs: dict[str, list[CostMetric]] = defaultdict(list)
@@ -111,8 +119,22 @@ class FactStore:
         self.access_window_days = 90
         self._job_writes: dict[str, set[str]] | None = None
         self._cache: dict[tuple, DeltaTableFacts] = {}
+        self._workloads: Any = None
         for o in objects:
             self.add(o)
+
+    @property
+    def workloads(self) -> Any:
+        """Cluster / job / pipeline facts (built lazily, shared by the workload agents)."""
+        import threading
+
+        lock = self.__dict__.setdefault("_wl_lock", threading.Lock())
+        with lock:  # agents run in parallel threads; build once
+            if self._workloads is None:
+                from cco.etl.workload_facts import WorkloadFactStore
+
+                self._workloads = WorkloadFactStore(self)
+            return self._workloads
 
     # ------------------------------------------------------------------ indexing
     def add(self, o: CanonicalObject) -> None:
@@ -124,7 +146,9 @@ class FactStore:
                 self.access_window_days = int(o.attributes.get("window_days") or self.access_window_days)
         elif isinstance(o, CostMetric):
             self.costs[o.resource_id].append(o)
+            self.__dict__.setdefault("_cost_cache", {}).pop(o.resource_id, None)
         self._job_writes = None
+        self._workloads = None
         self._cache.clear()
 
     def of_type(self, object_type: str) -> list[CanonicalObject]:
@@ -147,7 +171,57 @@ class FactStore:
 
     # ------------------------------------------------------------------ cost & causal facts
     def monthly_cost(self, resource_id: str) -> float:
-        return sum(c.monthly_amount for c in self.costs.get(str(resource_id), []))
+        """Robust steady-state monthly cost (see `cost_details`)."""
+        return self.cost_details(resource_id)["monthly_cost"]
+
+    def incident_cost(self, resource_id: str) -> float:
+        """Spend from canceled / failed runs or updates in the cost window (excluded from `monthly_cost`)."""
+        return self.cost_details(resource_id)["incident_cost"]
+
+    def cost_details(self, resource_id: str) -> dict[str, Any]:
+        """Monthly cost estimate that is robust to one-off spikes.
+
+        * Daily rows (attributes.granularity == 'day'): canceled/failed-run spend is split out as `incident_cost`;
+          the remaining daily steady-state cost is winsorized at `outlier_cap_x_median` x the median active-day cost,
+          summed, and scaled to 30 days over max(observed window, `min_observation_days`). Days without usage count as 0.
+        * Period rows (other providers / aggregated billing): amount x 30 / period_days, as before.
+        """
+        rid = str(resource_id)
+        cache = self.__dict__.setdefault("_cost_cache", {})
+        if rid in cache:
+            return cache[rid]
+        cfg = {**self.COST_DEFAULTS, **getattr(self, "cost_cfg", {})}
+        rows = self.costs.get(rid, [])
+        daily = [c for c in rows if c.attributes.get("granularity") == "day" and c.period_start]
+        period = [c for c in rows if c not in daily]
+        out: dict[str, Any] = {"monthly_cost": sum(c.monthly_amount for c in period), "incident_cost": 0.0,
+                               "trimmed_cost": 0.0, "raw_monthly_cost": None, "observed_days": None, "active_days": None,
+                               "basis": "period_average" if period else None}
+        out["incident_cost"] = sum(float(c.attributes.get("incident_amount") or 0.0) for c in period)
+        if daily:
+            steady: dict[Any, float] = defaultdict(float)
+            incident = 0.0
+            for c in daily:
+                inc = min(max(float(c.attributes.get("incident_amount") or 0.0), 0.0), max(c.amount, 0.0))
+                incident += inc
+                steady[c.period_start.date()] += c.amount - inc
+            days = sorted(steady)
+            end = max(days[-1], self.now.date())
+            observed = (end - days[0]).days + 1
+            window = max(observed, int(cfg["min_observation_days"]))
+            active = [v for v in steady.values() if v > 0]
+            cap_x = float(cfg["outlier_cap_x_median"] or 0)
+            cap = median(active) * cap_x if active and cap_x > 0 else None
+            total = sum(steady.values())
+            kept = sum(min(v, cap) if cap is not None else v for v in steady.values())
+            out["monthly_cost"] += kept / window * 30.0
+            out["incident_cost"] += incident
+            out["trimmed_cost"] = max(0.0, total - kept)
+            out["raw_monthly_cost"] = (total + incident) / max(1, (days[-1] - days[0]).days) * 30.0
+            out["observed_days"], out["active_days"] = observed, len(active)
+            out["basis"] = "winsorized_daily" if not period else "winsorized_daily+period_average"
+        cache[rid] = out
+        return out
 
     def writer_jobs(self, table_id: str) -> list[str]:
         m = self.usage.get(table_id, {}).get("write_events")

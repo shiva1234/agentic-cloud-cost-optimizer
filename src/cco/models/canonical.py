@@ -81,6 +81,43 @@ class ActionType(str, Enum):
     ARCHIVE_TABLE = "archive_table"
     REVIEW_UPSTREAM_JOB = "review_upstream_job"
     REVIEW = "review"
+    # compute (agent B)
+    RESIZE_CLUSTER = "resize_cluster"
+    ENABLE_AUTOSCALING = "enable_autoscaling"
+    TUNE_AUTOSCALING = "tune_autoscaling"
+    SET_AUTOTERMINATION = "set_autotermination"
+    CONVERT_TO_JOB_CLUSTER = "convert_to_job_cluster"
+    USE_SPOT = "use_spot"
+    CHANGE_NODE_TYPE = "change_node_type"
+    CONSOLIDATE_CLUSTERS = "consolidate_clusters"
+    SCHEDULE_START_STOP = "schedule_start_stop"
+    REDUCE_STARTUP_OVERHEAD = "reduce_startup_overhead"
+    CONSOLIDATE_POOLS = "consolidate_pools"
+    REDUCE_POOL_IDLE = "reduce_pool_idle"
+    # jobs / workflows (agent C)
+    MERGE_JOBS = "merge_jobs"
+    CHAIN_JOBS = "chain_jobs"
+    REDUCE_RETRIES = "reduce_retries"
+    ADD_INCREMENTAL = "add_incremental"
+    TRIGGER_ON_CHANGE = "trigger_on_change"
+    SHIFT_SCHEDULE = "shift_schedule"
+    DECOMMISSION_JOB = "decommission_job"
+    FIX_FAILING_WORKLOAD = "fix_failing_workload"
+    CONSOLIDATE_DEPLOYMENTS = "consolidate_deployments"
+    # pipelines (agent D)
+    PAUSE_PIPELINE = "pause_pipeline"
+    ARCHIVE_PIPELINE = "archive_pipeline"
+    DEDUPLICATE_PIPELINE = "deduplicate_pipeline"
+    REDUCE_FREQUENCY = "reduce_frequency"
+    PRIORITIZE_PIPELINE = "prioritize_pipeline"
+
+
+# Actions that retire a resource; they supersede tuning actions on the same resource
+DECOMMISSION_ACTIONS = {
+    ActionType.ARCHIVE_TABLE, ActionType.DECOMMISSION_JOB, ActionType.MERGE_JOBS,
+    ActionType.PAUSE_PIPELINE, ActionType.ARCHIVE_PIPELINE, ActionType.DEDUPLICATE_PIPELINE,
+    ActionType.CONSOLIDATE_DEPLOYMENTS,
+}
 
 
 class RecommendationStatus(str, Enum):
@@ -146,6 +183,21 @@ class Cluster(CanonicalObject):
     state: str | None = None
     policy_id: str | None = None
     photon: bool | None = None
+    owner: str | None = None
+    availability: str | None = None          # ON_DEMAND | SPOT | SPOT_WITH_FALLBACK ...
+    driver_pool_id: str | None = None
+    worker_pool_id: str | None = None
+    worker_cores: float | None = None
+    worker_memory_mb: float | None = None
+    deleted: bool = False
+
+    @property
+    def is_job_cluster(self) -> bool:
+        return (self.cluster_source or "").upper() in ("JOB", "PIPELINE", "PIPELINE_MAINTENANCE")
+
+    @property
+    def autoscale(self) -> bool:
+        return self.max_workers is not None and self.max_workers > 0
 
 
 @dataclass(kw_only=True)
@@ -177,6 +229,62 @@ class Pipeline(CanonicalObject):
     photon: bool | None = None
     edition: str | None = None
     creator: str | None = None
+
+
+@dataclass(kw_only=True)
+class ComputePool(CanonicalObject):
+    OBJECT_TYPE: ClassVar[str] = "compute_pool"
+    node_type: str | None = None
+    min_idle: int = 0
+    max_capacity: int | None = None
+    idle_autotermination_minutes: int | None = None
+    used_count: int = 0
+    idle_count: int = 0
+    availability: str | None = None
+
+
+@dataclass(kw_only=True)
+class RunStats(CanonicalObject):
+    """Aggregated run history for a job or pipeline over a lookback window."""
+
+    OBJECT_TYPE: ClassVar[str] = "run_stats"
+    resource_id: str = ""
+    resource_type: str = "job"            # job | pipeline
+    window_days: int = 30
+    runs: int = 0
+    success_rate: float | None = None
+    avg_run_s: float | None = None
+    std_run_s: float | None = None
+    avg_exec_s: float | None = None
+    avg_queue_s: float | None = None
+    avg_setup_s: float | None = None
+    total_hours: float | None = None
+    first_run: datetime | None = None
+    last_run: datetime | None = None
+    task_runs: int = 0
+    retries: int = 0
+    retried_task_runs: int = 0
+    retried_then_succeeded: int = 0
+    full_refreshes: int = 0
+    trigger_types: dict[str, int] = field(default_factory=dict)
+    start_hour_histogram: dict[int, int] = field(default_factory=dict)
+    compute_ids: list[str] = field(default_factory=list)
+
+    @property
+    def runs_per_day(self) -> float:
+        return self.runs / max(1, self.window_days)
+
+
+@dataclass(kw_only=True)
+class Lineage(CanonicalObject):
+    """Observed source/target datasets of a workload (job, pipeline)."""
+
+    OBJECT_TYPE: ClassVar[str] = "lineage"
+    resource_id: str = ""
+    resource_type: str = "job"
+    sources: list[str] = field(default_factory=list)
+    targets: list[str] = field(default_factory=list)
+    last_event: datetime | None = None
 
 
 @dataclass
@@ -284,11 +392,16 @@ class Finding:
     detail: str
     severity: Severity = Severity.MEDIUM
     metrics: dict[str, Any] = field(default_factory=dict)
-    id: str = field(default_factory=new_id)
+    # keys of `metrics` that describe the resource itself (stored once per resource and run, not per finding)
+    resource_metric_keys: list[str] = field(default_factory=list)
+    id: str = ""
     created_at: datetime = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
         self.severity = Severity(self.severity)
+        if not self.id:
+            # deterministic: the same check on the same resource keeps one id across runs (trend / compare runs)
+            self.id = stable_id("finding", self.agent, self.check, self.resource_type, self.resource_id)
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
@@ -312,6 +425,10 @@ class Recommendation:
     savings_basis: str = ""
     metrics: dict[str, Any] = field(default_factory=dict)
     depends_on: list[str] = field(default_factory=list)
+    related_resources: list[str] = field(default_factory=list)
+    group_id: str | None = None
+    queue_rank: int | None = None
+    superseded_by: str | None = None
     score: float = 0.0
     priority: str = "P4"
     score_breakdown: dict[str, float] = field(default_factory=dict)

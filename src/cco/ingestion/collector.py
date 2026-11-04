@@ -21,6 +21,7 @@ class IngestionReport:
     run_id: str
     counts: dict[str, int] = field(default_factory=dict)
     errors: list[dict] = field(default_factory=list)
+    warnings: list[dict] = field(default_factory=list)
     started_at: datetime = field(default_factory=utcnow)
     finished_at: datetime | None = None
 
@@ -74,5 +75,9 @@ class MetadataCollector:
                         n += len(buf)
                 report.counts[key] = n
                 log.info("collected %s records for %s", n, key)
+                for w in getattr(conn, "warnings", [])[:]:
+                    report.warnings.append({"connector": conn.name, "entity": entity, "warning": w[:500]})
+                if hasattr(conn, "warnings"):
+                    conn.warnings.clear()
         report.finished_at = utcnow()
         return report

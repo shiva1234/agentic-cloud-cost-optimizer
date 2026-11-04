@@ -5,7 +5,8 @@
   3. multi-agent analysis    planner -> specialist agents -> coordinator (one merged report)
   4. rule-based scoring      deterministic points + priority bands
   5. AI reasoning layer      LLM summaries + bounded confidence adjustment, then re-score
-  6. human approval          persisted queue; nothing executes without approval
+  6. optimization queue      cross-agent groups ranked by impact (cco.agents.queue)
+     human approval          persisted queue; nothing executes without approval
   7. alerts / UI / API       notify approvers, render report
   8. (optional) actions      executes ONLY previously-approved, validated commands
 """
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cco.actions.executor import ActionExecutor, ExecutionResult
-from cco.agents import AgentContext, AnalysisReport, Coordinator, Planner, build_agents
+from cco.agents import AgentContext, AnalysisReport, Coordinator, Planner, build_agents, build_optimization_queue
 from cco.approval.workflow import ApprovalPolicy, ApprovalWorkflow
 from cco.config import get_path, load_config
 from cco.connectors.base import BaseConnector
@@ -32,7 +33,8 @@ from cco.interfaces.report import to_markdown
 from cco.llm.reasoner import LLMClient, LLMReasoner
 from cco.scoring.engine import ScoringEngine
 from cco.storage.raw_store import DeltaRawStore, InMemoryRawStore, RawMetadataStore
-from cco.storage.repository import DeltaRecommendationRepository, InMemoryRecommendationRepository, RecommendationRepository
+from cco.storage.repository import (DeltaRecommendationRepository, InMemoryRecommendationRepository, RecommendationRepository,
+                                    finding_members)
 from cco.utils import utcnow
 
 log = logging.getLogger(__name__)
@@ -97,13 +99,55 @@ class CostOptimizationPipeline:
 
     def run(self, request: dict[str, Any] | None = None, execute_actions: bool = False, run_id: str | None = None) -> PipelineResult:
         run_id = run_id or f"{utcnow():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
+        started = utcnow()
+        self._record_run(run_id, started, None, "running", request)
+        try:
+            res = self._run(run_id, request, execute_actions)
+        except Exception as e:
+            self._record_run(run_id, started, utcnow(), "failed", request, error=f"{type(e).__name__}: {e}"[:2000])
+            raise
+        self._record_run(run_id, started, utcnow(), "succeeded", request, agents=res.report.plan.agent_names)
+        return res
+
+    def _record_run(self, run_id: str, started: Any, finished: Any, status: str, request: dict | None,
+                    agents: list[str] | None = None, error: str | None = None) -> None:
+        try:
+            self.repo.save_run({"run_id": run_id, "started_at": started, "finished_at": finished, "status": status,
+                                "request": json.dumps(request, default=str) if request else None,
+                                "agents_run": list(agents) if agents is not None else None, "error_message": error})
+        except Exception:  # noqa: BLE001 - run bookkeeping must never mask the run itself
+            log.exception("could not record run %s", run_id)
+
+    def _catalog(self, objects: list[Any], report: AnalysisReport) -> tuple[list[dict], list[dict]]:
+        """Resource + check dimension rows for everything the run's findings / recommendations reference."""
+        refs = {(f.resource_type, f.resource_id) for f in report.findings}
+        refs |= {m for f in report.findings for m in finding_members(f)}
+        refs |= {(r.resource_type, r.resource_id) for r in report.recommendations}
+        by_id: dict[str, list[Any]] = {}
+        for o in objects:
+            by_id.setdefault(str(o.id), []).append(o)
+        resources = []
+        for rtype, rid in sorted(refs):
+            cands = by_id.get(rid) or []
+            o = next((c for c in cands if c.object_type == rtype), cands[0] if cands else None)
+            owner = (getattr(o, "owner", None) or getattr(o, "creator", None)) if o else None
+            run_as = (getattr(o, "run_as", None) or o.attributes.get("run_as")) if o else None
+            resources.append({"resource_type": rtype, "resource_id": rid, "resource_name": (o.name or None) if o else None,
+                              "workspace_id": str(o.workspace_id) if o and o.workspace_id else None,
+                              "owner": str(owner) if owner else None, "run_as": str(run_as) if run_as else None})
+        checks = {f.check: {"check_name": f.check, "agent": f.agent,
+                            "domain": getattr(self.agents.get(f.agent), "domain", None)} for f in report.findings}
+        return resources, sorted(checks.values(), key=lambda c: c["check_name"])
+
+    def _run(self, run_id: str, request: dict[str, Any] | None, execute_actions: bool) -> PipelineResult:
         log.info("run %s: 1/8 metadata collection", run_id)
         ingestion = MetadataCollector(self.connectors, self.raw_store).run(run_id)
 
         log.info("run %s: 2/8 normalization + facts", run_id)
         norm = Normalizer().normalize(self.raw_store.read(run_id))
         price = float(get_path(self.cfg, "agents.delta_table_optimization.thresholds.storage_cost_per_gb_month", 0.023))
-        facts = FactStore(norm.objects, storage_cost_per_gb_month=price)
+        facts = FactStore(norm.objects, storage_cost_per_gb_month=price,
+                          cost_estimation=get_path(self.cfg, "cost_estimation", None) or {})
 
         log.info("run %s: 3/8 multi-agent analysis", run_id)
         plan = self.planner.plan(facts, request)
@@ -117,10 +161,17 @@ class CostOptimizationPipeline:
         report = self.reasoner.enrich(report)
         report.recommendations = self.scoring.score(report.recommendations)  # re-score with adjusted confidence
 
-        log.info("run %s: 6/8 human approval queue", run_id)
+        log.info("run %s: 6/8 optimization queue + human approval", run_id)
+        queue = build_optimization_queue(report.recommendations, self.scoring.rules)
         stored = self.workflow.submit(report.recommendations)
         report.recommendations = self.scoring.rank(stored)
+        queue.refresh_statuses(stored)
+        report.queue = queue.items
+        report.summary["queue_items"] = len(queue)
+        report.summary["queue_combined_monthly_savings"] = round(sum(i.combined_monthly_savings for i in queue), 2)
         self.repo.save_findings(run_id, report.findings)
+        self.repo.save_queue(run_id, queue.items)
+        self.repo.save_catalog(run_id, *self._catalog(norm.objects, report))
         queued = sum(1 for r in stored if r.status.value == "pending_approval")
 
         log.info("run %s: 7/8 alerts", run_id)

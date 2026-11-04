@@ -133,7 +133,8 @@ class DeltaTableOptimizationAgent(BaseAgent):
         return Recommendation(resource_id=table.id, resource_type="table", action_type=action, title=title, rationale=rationale,
                               agent=self.name, command=command, severity=severity, risk=risk, reversible=reversible,
                               confidence=confidence, estimated_monthly_savings=round(max(0.0, savings), 2),
-                              savings_basis=basis, metrics=metrics)
+                              savings_basis=basis, metrics=metrics,
+                              related_resources=[str(j) for j in metrics.get("writer_job_ids") or []])
 
     def _price(self) -> float:
         return float(self.t["storage_cost_per_gb_month"])

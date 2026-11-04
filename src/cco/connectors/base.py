@@ -30,6 +30,10 @@ ENTITIES: tuple[str, ...] = (
     "compute_metrics",
     "access_logs",
     "costs",
+    "pools",
+    "job_run_stats",
+    "pipeline_run_stats",
+    "lineage",
 )
 
 Collected = Iterator[tuple[str, dict[str, Any]]]
@@ -66,6 +70,11 @@ class BaseConnector(ABC):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = dict(config or {})
+        # non-fatal problems (e.g. permission denied on one catalog); surfaced in the IngestionReport
+        self.warnings: list[str] = []
+
+    def warn(self, msg: str) -> None:
+        self.warnings.append(msg)
 
     @abstractmethod
     def supported_entities(self) -> set[str]:
